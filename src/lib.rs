@@ -45,13 +45,26 @@ pub mod relay;
 pub mod signer;
 pub mod transport;
 
+#[cfg(feature = "rmcp")]
+pub mod rmcp_transport;
 // Re-export commonly used types
 pub use core::error::{Error, Result};
 pub use core::types::{
-    CapabilityExclusion, ClientSession, EncryptionMode, JsonRpcError, JsonRpcErrorResponse,
-    JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, ServerInfo,
+    CapabilityExclusion, ClientSession, EncryptionMode, GiftWrapMode, JsonRpcError,
+    JsonRpcErrorResponse, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
+    ServerInfo,
 };
 pub use discovery::ServerAnnouncement;
-pub use relay::RelayPool;
-pub use transport::client::{NostrClientTransport, NostrClientTransportConfig};
-pub use transport::server::{IncomingRequest, NostrServerTransport, NostrServerTransportConfig};
+pub use relay::mock::MockRelayPool;
+pub use relay::{RelayPool, RelayPoolTrait};
+pub use transport::client::{
+    ClientCorrelationStore, NostrClientTransport, NostrClientTransportConfig,
+};
+pub use transport::discovery_tags::{DiscoveredPeerCapabilities, PeerCapabilities};
+pub use transport::server::{
+    IncomingRequest, NostrServerTransport, NostrServerTransportConfig, RouteEntry,
+    ServerEventRouteStore, SessionSnapshot, SessionStore,
+};
+
+#[cfg(feature = "rmcp")]
+pub use rmcp;

@@ -77,19 +77,16 @@ use contextvm_sdk::signer;
 async fn main() -> contextvm_sdk::Result<()> {
     let keys = signer::generate();
 
-    let config = GatewayConfig {
-        nostr_config: NostrServerTransportConfig {
-            relay_urls: vec!["wss://relay.damus.io".into()],
-            encryption_mode: EncryptionMode::Optional,
-            server_info: Some(ServerInfo {
-                name: Some("My MCP Server".into()),
-                about: Some("Tools via Nostr".into()),
-                ..Default::default()
-            }),
-            is_public_server: true,
-            ..Default::default()
-        },
-    };
+    let config = GatewayConfig::new(
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Optional)
+            .with_server_info(
+                ServerInfo::default()
+                    .with_name("My MCP Server")
+                    .with_about("Tools via Nostr"),
+            )
+            .with_announced_server(true),
+    );
 
     let mut gateway = NostrMCPGateway::new(keys, config).await?;
     let mut requests = gateway.start().await?;
@@ -116,14 +113,11 @@ use contextvm_sdk::signer;
 async fn main() -> contextvm_sdk::Result<()> {
     let keys = signer::generate();
 
-    let config = ProxyConfig {
-        nostr_config: NostrClientTransportConfig {
-            relay_urls: vec!["wss://relay.damus.io".into()],
-            server_pubkey: "abc123...server_hex_pubkey".into(),
-            encryption_mode: EncryptionMode::Optional,
-            ..Default::default()
-        },
-    };
+    let config = ProxyConfig::new(
+        NostrClientTransportConfig::default()
+            .with_server_pubkey("abc123...server_hex_pubkey")
+            .with_encryption_mode(EncryptionMode::Optional),
+    );
 
     let mut proxy = NostrMCPProxy::new(keys, config).await?;
     let mut responses = proxy.start().await?;
@@ -201,7 +195,7 @@ metadata-private delivery. Server announcements (kinds 11316–11320) are always
 | `relay_urls`             | `["wss://relay.damus.io"]` | Nostr relays to connect to          |
 | `encryption_mode`        | `Optional`            | Encryption policy                        |
 | `server_info`            | `None`                | Server metadata for announcements        |
-| `is_public_server`       | `false`               | Whether to publish announcements         |
+| `is_announced_server`    | `false`               | Whether to publish announcements (CEP-6) |
 | `allowed_public_keys`    | `[]` (allow all)      | Client pubkey allowlist (hex)            |
 | `excluded_capabilities`  | `[]`                  | Methods exempt from allowlist            |
 | `session_timeout`        | `300s`                | Inactive session expiry                  |
