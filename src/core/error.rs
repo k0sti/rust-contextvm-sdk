@@ -34,6 +34,14 @@ pub enum Error {
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
+    /// CEP-22 oversized payload transfer error (framing/reassembly)
+    #[error("Oversized transfer error: {0}")]
+    OversizedTransfer(#[from] crate::transport::oversized_transfer::OversizedTransferError),
+
+    /// CEP-41 open-stream error (sequencing/policy/abort)
+    #[error("Open stream error: {0}")]
+    OpenStream(#[from] crate::transport::open_stream::OpenStreamError),
+
     /// Generic error
     #[error("{0}")]
     Other(String),

@@ -39,6 +39,8 @@ ContextVM maps MCP's JSON-RPC 2.0 messages onto Nostr events:
 |---------|------------------------|-------------|--------------------------------------|
 | `25910` | ContextVM Messages     | Ephemeral   | MCP request/response/notification    |
 | `1059`  | Gift Wrap (NIP-59)     | Regular     | Encrypted MCP messages               |
+| `21059` | Ephemeral Gift Wrap    | Ephemeral   | Encrypted MCP messages (CEP-19)      |
+| `10002` | Relay List Metadata    | Replaceable | Server's advertised relays (CEP-17)  |
 | `11316` | Server Announcement    | Addressable | Server identity & metadata           |
 | `11317` | Tools List             | Addressable | Published tool capabilities          |
 | `11318` | Resources List         | Addressable | Published resource capabilities      |
@@ -53,7 +55,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-contextvm-sdk = { git = "https://github.com/k0sti/rust-contextvm-sdk" }
+contextvm-sdk = { git = "https://github.com/ContextVM/rs-sdk" }
 ```
 
 Or clone and use as a path dependency:
@@ -77,19 +79,16 @@ use contextvm_sdk::signer;
 async fn main() -> contextvm_sdk::Result<()> {
     let keys = signer::generate();
 
-    let config = GatewayConfig {
-        nostr_config: NostrServerTransportConfig {
-            relay_urls: vec!["wss://relay.damus.io".into()],
-            encryption_mode: EncryptionMode::Optional,
-            server_info: Some(ServerInfo {
-                name: Some("My MCP Server".into()),
-                about: Some("Tools via Nostr".into()),
-                ..Default::default()
-            }),
-            is_public_server: true,
-            ..Default::default()
-        },
-    };
+    let config = GatewayConfig::new(
+        NostrServerTransportConfig::default()
+            .with_encryption_mode(EncryptionMode::Optional)
+            .with_server_info(
+                ServerInfo::default()
+                    .with_name("My MCP Server")
+                    .with_about("Tools via Nostr"),
+            )
+            .with_announced_server(true),
+    );
 
     let mut gateway = NostrMCPGateway::new(keys, config).await?;
     let mut requests = gateway.start().await?;
@@ -116,14 +115,11 @@ use contextvm_sdk::signer;
 async fn main() -> contextvm_sdk::Result<()> {
     let keys = signer::generate();
 
-    let config = ProxyConfig {
-        nostr_config: NostrClientTransportConfig {
-            relay_urls: vec!["wss://relay.damus.io".into()],
-            server_pubkey: "abc123...server_hex_pubkey".into(),
-            encryption_mode: EncryptionMode::Optional,
-            ..Default::default()
-        },
-    };
+    let config = ProxyConfig::new(
+        NostrClientTransportConfig::default()
+            .with_server_pubkey("abc123...server_hex_pubkey")
+            .with_encryption_mode(EncryptionMode::Optional),
+    );
 
     let mut proxy = NostrMCPProxy::new(keys, config).await?;
     let mut responses = proxy.start().await?;
@@ -168,6 +164,22 @@ async fn main() -> contextvm_sdk::Result<()> {
 }
 ```
 
+## Documentation
+
+The in-repo Rust SDK guides live in [`docs/README.md`](docs/README.md):
+
+- For most users, the main pattern is: build an `rmcp` server or client, then attach [`NostrServerTransport`](src/transport/server/mod.rs:87) or [`NostrClientTransport`](src/transport/client/mod.rs:69).
+
+- [`docs/overview.md`](docs/overview.md)
+- [`docs/server-transport.md`](docs/server-transport.md)
+- [`docs/client-transport.md`](docs/client-transport.md)
+- [`docs/discovery.md`](docs/discovery.md)
+- [`docs/encryption.md`](docs/encryption.md)
+- [`docs/rmcp.md`](docs/rmcp.md)
+- [`docs/transports.md`](docs/transports.md)
+- [`docs/gateway.md`](docs/gateway.md)
+- [`docs/proxy.md`](docs/proxy.md)
+
 ## Module Overview
 
 | Module         | Description                                                    |
@@ -194,6 +206,12 @@ async fn main() -> contextvm_sdk::Result<()> {
 Encryption uses **NIP-44** for payload encryption and **NIP-59** (Gift Wrap) for
 metadata-private delivery. Server announcements (kinds 11316–11320) are always public.
 
+Messages too large for a single relay event are fragmented into ordered frames
+and reassembled by the receiver (CEP-22 oversized transfer, enabled by default;
+it adds no event kind — frames ride inside `notifications/progress` messages).
+See [docs/oversized-transfer.md](docs/oversized-transfer.md) for the timeout
+model and tuning.
+
 ### Server Transport Config
 
 | Field                    | Default               | Description                              |
@@ -201,20 +219,30 @@ metadata-private delivery. Server announcements (kinds 11316–11320) are always
 | `relay_urls`             | `["wss://relay.damus.io"]` | Nostr relays to connect to          |
 | `encryption_mode`        | `Optional`            | Encryption policy                        |
 | `server_info`            | `None`                | Server metadata for announcements        |
-| `is_public_server`       | `false`               | Whether to publish announcements         |
+| `is_announced_server`    | `false`               | Auto-publish announcements on start (CEP-6) |
 | `allowed_public_keys`    | `[]` (allow all)      | Client pubkey allowlist (hex)            |
 | `excluded_capabilities`  | `[]`                  | Methods exempt from allowlist            |
 | `session_timeout`        | `300s`                | Inactive session expiry                  |
+| `relay_list_urls`        | `None`                | Relay URLs for kind 10002 (CEP-17); defaults to `relay_urls` |
+| `bootstrap_relay_urls`   | `None`                | Additional relays for publishing announcements (CEP-6/17) |
+| `publish_relay_list`     | `true`                | Whether to publish kind 10002 relay list metadata |
+| `profile_metadata`       | `None`                | Profile metadata for kind 0 publication (CEP-23) |
+| `oversized_transfer`     | enabled               | CEP-22 oversized payload transfer config ([guide](docs/oversized-transfer.md)) |
 
 ### Client Transport Config
 
-| Field             | Default                    | Description                          |
-|-------------------|----------------------------|--------------------------------------|
-| `relay_urls`      | `["wss://relay.damus.io"]` | Nostr relays to connect to           |
-| `server_pubkey`   | (required)                 | Target server's public key (hex)     |
-| `encryption_mode` | `Optional`                 | Encryption policy                    |
-| `is_stateless`    | `false`                    | Emulate initialize locally           |
-| `timeout`         | `30s`                      | Response timeout                     |
+| Field                              | Default                    | Description                          |
+|------------------------------------|----------------------------|--------------------------------------|
+| `relay_urls`                       | `[]`                       | Nostr relays to connect to (empty = use relay resolution) |
+| `server_pubkey`                    | (required)                 | Target server's public key (hex, npub, or nprofile) |
+| `encryption_mode`                  | `Optional`                 | Encryption policy                    |
+| `is_stateless`                     | `false`                    | Emulate initialize locally           |
+| `timeout`                          | `30s`                      | Response timeout                     |
+| `discovery_relay_urls`             | `None` (bootstrap relays)  | Relays for CEP-17 kind 10002 discovery |
+| `fallback_operational_relay_urls`  | `None`                     | Relays probed in parallel with CEP-17 discovery |
+| `oversized_transfer`               | enabled                    | CEP-22 oversized payload transfer config ([guide](docs/oversized-transfer.md)) |
+
+When `relay_urls` is empty, `start()` runs automatic relay resolution: configured relays > nprofile hints > CEP-17 kind 10002 discovery > fallback probing > bootstrap defaults.
 
 ## References
 
