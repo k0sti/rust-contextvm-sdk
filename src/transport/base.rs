@@ -9,7 +9,9 @@ use crate::core::serializers;
 use crate::core::types::{EncryptionMode, JsonRpcMessage};
 use crate::core::validation;
 use crate::encryption;
-use crate::relay::RelayPool;
+use crate::relay::RelayPoolTrait;
+
+const LOG_TARGET: &str = "contextvm_sdk::transport::base";
 
 /// Shared transport logic for both client and server.
 ///
@@ -18,7 +20,7 @@ use crate::relay::RelayPool;
 /// and [`NostrServerTransport`](super::server::NostrServerTransport).
 pub struct BaseTransport {
     /// The relay pool for publishing and subscribing to Nostr events.
-    pub relay_pool: Arc<RelayPool>,
+    pub relay_pool: Arc<dyn RelayPoolTrait>,
     /// The encryption policy for outgoing messages.
     pub encryption_mode: EncryptionMode,
     /// Whether the transport is currently connected to relays.
@@ -53,39 +55,39 @@ impl BaseTransport {
 
     /// Subscribe to events targeting a pubkey (both regular and encrypted).
     ///
-    /// Uses two filters: one for ephemeral ContextVM messages (kind 25910)
-    /// with `since: now()`, and one for NIP-59 gift wraps (kind 1059) without
-    /// a `since` constraint. Gift wraps use randomized timestamps per NIP-59,
-    /// so a `since: now()` filter would reject most incoming encrypted messages.
+    /// Uses three filters: one for ephemeral ContextVM messages (kind 25910)
+    /// and two for NIP-59 gift wraps (kinds 1059 and 21059).
     pub async fn subscribe_for_pubkey(&self, pubkey: &PublicKey) -> Result<()> {
         let p_tag = pubkey.to_hex();
+        let now = Timestamp::now();
 
-        // Ephemeral ContextVM messages — safe to use since:now()
         let ephemeral_filter = Filter::new()
             .kind(Kind::Custom(CTXVM_MESSAGES_KIND))
             .custom_tag(SingleLetterTag::lowercase(Alphabet::P), p_tag.clone())
-            .since(Timestamp::now());
+            .since(now);
 
-        // NIP-59 gift wraps — timestamps are randomized (up to ±48h or more),
-        // so we must NOT use since:now(). Limit to recent window instead.
-        let two_days_ago = Timestamp::from(Timestamp::now().as_u64().saturating_sub(2 * 24 * 3600));
         let gift_wrap_filter = Filter::new()
             .kind(Kind::Custom(GIFT_WRAP_KIND))
-            .custom_tag(SingleLetterTag::lowercase(Alphabet::P), p_tag)
-            .since(two_days_ago);
+            .custom_tag(SingleLetterTag::lowercase(Alphabet::P), p_tag.clone())
+            .since(now);
 
-        self.relay_pool.subscribe(vec![ephemeral_filter, gift_wrap_filter]).await
+        let ephemeral_gift_wrap_filter = Filter::new()
+            .kind(Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND))
+            .custom_tag(SingleLetterTag::lowercase(Alphabet::P), p_tag)
+            .since(now);
+
+        self.relay_pool
+            .subscribe(vec![
+                ephemeral_filter,
+                gift_wrap_filter,
+                ephemeral_gift_wrap_filter,
+            ])
+            .await
     }
 
     /// Convert a Nostr event to an MCP message with validation.
     pub fn convert_event_to_mcp(&self, content: &str) -> Option<JsonRpcMessage> {
-        if !validation::validate_message_size(content) {
-            tracing::warn!("Message size validation failed: {} bytes", content.len());
-            return None;
-        }
-
-        let value: serde_json::Value = serde_json::from_str(content).ok()?;
-        validation::validate_message(&value)
+        validation::validate_and_parse(content)
     }
 
     /// Create a signed Nostr event for an MCP message.
@@ -99,9 +101,62 @@ impl BaseTransport {
         self.relay_pool.sign(builder).await
     }
 
+    /// Prepare an MCP message for publishing without actually publishing it.
+    ///
+    /// Signs (and optionally gift-wraps) the event, returning the inner signed
+    /// event ID together with the final event that should be published to relays.
+    pub async fn prepare_mcp_message(
+        &self,
+        message: &JsonRpcMessage,
+        recipient: &PublicKey,
+        kind: u16,
+        tags: Vec<Tag>,
+        is_encrypted: Option<bool>,
+        gift_wrap_kind: Option<u16>,
+    ) -> Result<(EventId, Event)> {
+        let should_encrypt = self.should_encrypt(kind, is_encrypted);
+
+        let event = self.create_signed_event(message, kind, tags).await?;
+        let signed_event_id = event.id;
+
+        if should_encrypt {
+            let event_json =
+                serde_json::to_string(&event).map_err(|e| Error::Encryption(e.to_string()))?;
+            let signer = self
+                .relay_pool
+                .signer()
+                .await
+                .map_err(|e| Error::Encryption(e.to_string()))?;
+            let selected_gift_wrap_kind = gift_wrap_kind.unwrap_or(GIFT_WRAP_KIND);
+            let gift_wrap_event = encryption::gift_wrap_single_layer_with_kind(
+                &signer,
+                recipient,
+                &event_json,
+                selected_gift_wrap_kind,
+            )
+            .await?;
+            tracing::debug!(
+                target: LOG_TARGET,
+                signed_event_id = %signed_event_id,
+                envelope_id = %gift_wrap_event.id,
+                gift_wrap_kind = selected_gift_wrap_kind,
+                "Prepared encrypted MCP message"
+            );
+            Ok((signed_event_id, gift_wrap_event))
+        } else {
+            tracing::debug!(
+                target: LOG_TARGET,
+                signed_event_id = %signed_event_id,
+                "Prepared unencrypted MCP message"
+            );
+            Ok((signed_event_id, event))
+        }
+    }
+
     /// Send an MCP message to a recipient, optionally encrypting.
     ///
-    /// Returns the event ID of the published event.
+    /// Returns the signed MCP event ID.
+    /// When encrypted, this is the inner signed event ID.
     pub async fn send_mcp_message(
         &self,
         message: &JsonRpcMessage,
@@ -109,29 +164,49 @@ impl BaseTransport {
         kind: u16,
         tags: Vec<Tag>,
         is_encrypted: Option<bool>,
+        gift_wrap_kind: Option<u16>,
     ) -> Result<EventId> {
         let should_encrypt = self.should_encrypt(kind, is_encrypted);
 
         let event = self.create_signed_event(message, kind, tags).await?;
+        let signed_event_id = event.id;
 
         if should_encrypt {
             // Single-layer gift wrap: JSON.stringify(signedEvent) → NIP-44 encrypt
             // This matches the JS/TS SDK's encryptMessage(JSON.stringify(event), recipient)
-            let event_json = serde_json::to_string(&event)
+            let event_json =
+                serde_json::to_string(&event).map_err(|e| Error::Encryption(e.to_string()))?;
+            let signer = self
+                .relay_pool
+                .signer()
+                .await
                 .map_err(|e| Error::Encryption(e.to_string()))?;
-            let signer = self.relay_pool.client().signer().await
-                .map_err(|e| Error::Encryption(e.to_string()))?;
-            let gift_wrap_event = encryption::gift_wrap_single_layer(
-                &signer, recipient, &event_json,
-            ).await?;
-            let event_id = self.relay_pool.publish_event(&gift_wrap_event).await?;
-            tracing::debug!(event_id = %event_id, "Sent encrypted MCP message");
-            Ok(event_id)
+            let selected_gift_wrap_kind = gift_wrap_kind.unwrap_or(GIFT_WRAP_KIND);
+            let gift_wrap_event = encryption::gift_wrap_single_layer_with_kind(
+                &signer,
+                recipient,
+                &event_json,
+                selected_gift_wrap_kind,
+            )
+            .await?;
+            self.relay_pool.publish_event(&gift_wrap_event).await?;
+            tracing::debug!(
+                target: LOG_TARGET,
+                signed_event_id = %signed_event_id,
+                envelope_id = %gift_wrap_event.id,
+                gift_wrap_kind = selected_gift_wrap_kind,
+                "Sent encrypted MCP message"
+            );
         } else {
-            let event_id = self.relay_pool.publish_event(&event).await?;
-            tracing::debug!(event_id = %event_id, "Sent unencrypted MCP message");
-            Ok(event_id)
+            self.relay_pool.publish_event(&event).await?;
+            tracing::debug!(
+                target: LOG_TARGET,
+                signed_event_id = %signed_event_id,
+                "Sent unencrypted MCP message"
+            );
         }
+
+        Ok(signed_event_id)
     }
 
     /// Determine whether a message should be encrypted.
@@ -157,13 +232,27 @@ impl BaseTransport {
     pub fn create_response_tags(pubkey: &PublicKey, event_id: &EventId) -> Vec<Tag> {
         vec![Tag::public_key(*pubkey), Tag::event(*event_id)]
     }
+
+    /// Compose outbound event tags in canonical order:
+    /// routing (p, e) -> discovery (one-shot caps) -> negotiation (pmi, persistent).
+    pub fn compose_outbound_tags(
+        base_tags: &[Tag],
+        discovery_tags: &[Tag],
+        negotiation_tags: &[Tag],
+    ) -> Vec<Tag> {
+        let mut tags =
+            Vec::with_capacity(base_tags.len() + discovery_tags.len() + negotiation_tags.len());
+        tags.extend_from_slice(base_tags);
+        tags.extend_from_slice(discovery_tags);
+        tags.extend_from_slice(negotiation_tags);
+        tags
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::types::*;
-    use nostr_sdk::prelude::*;
 
     // Test should_encrypt logic without constructing full BaseTransport
     fn should_encrypt(mode: EncryptionMode, kind: u16, is_encrypted: Option<bool>) -> bool {
@@ -179,24 +268,60 @@ mod tests {
 
     #[test]
     fn test_should_encrypt_disabled_mode() {
-        assert!(!should_encrypt(EncryptionMode::Disabled, CTXVM_MESSAGES_KIND, None));
-        assert!(!should_encrypt(EncryptionMode::Disabled, CTXVM_MESSAGES_KIND, Some(true)));
-        assert!(!should_encrypt(EncryptionMode::Disabled, CTXVM_MESSAGES_KIND, Some(false)));
+        assert!(!should_encrypt(
+            EncryptionMode::Disabled,
+            CTXVM_MESSAGES_KIND,
+            None
+        ));
+        assert!(!should_encrypt(
+            EncryptionMode::Disabled,
+            CTXVM_MESSAGES_KIND,
+            Some(true)
+        ));
+        assert!(!should_encrypt(
+            EncryptionMode::Disabled,
+            CTXVM_MESSAGES_KIND,
+            Some(false)
+        ));
     }
 
     #[test]
     fn test_should_encrypt_required_mode() {
-        assert!(should_encrypt(EncryptionMode::Required, CTXVM_MESSAGES_KIND, None));
-        assert!(should_encrypt(EncryptionMode::Required, CTXVM_MESSAGES_KIND, Some(false)));
-        assert!(should_encrypt(EncryptionMode::Required, CTXVM_MESSAGES_KIND, Some(true)));
+        assert!(should_encrypt(
+            EncryptionMode::Required,
+            CTXVM_MESSAGES_KIND,
+            None
+        ));
+        assert!(should_encrypt(
+            EncryptionMode::Required,
+            CTXVM_MESSAGES_KIND,
+            Some(false)
+        ));
+        assert!(should_encrypt(
+            EncryptionMode::Required,
+            CTXVM_MESSAGES_KIND,
+            Some(true)
+        ));
     }
 
     #[test]
     fn test_should_encrypt_optional_mode() {
         // Default (None) → true
-        assert!(should_encrypt(EncryptionMode::Optional, CTXVM_MESSAGES_KIND, None));
-        assert!(should_encrypt(EncryptionMode::Optional, CTXVM_MESSAGES_KIND, Some(true)));
-        assert!(!should_encrypt(EncryptionMode::Optional, CTXVM_MESSAGES_KIND, Some(false)));
+        assert!(should_encrypt(
+            EncryptionMode::Optional,
+            CTXVM_MESSAGES_KIND,
+            None
+        ));
+        assert!(should_encrypt(
+            EncryptionMode::Optional,
+            CTXVM_MESSAGES_KIND,
+            Some(true)
+        ));
+        assert!(!should_encrypt(
+            EncryptionMode::Optional,
+            CTXVM_MESSAGES_KIND,
+            Some(false)
+        ));
     }
 
     #[test]
@@ -224,10 +349,9 @@ mod tests {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
         // Create a dummy event ID
-        let event_id = EventId::from_hex(
-            "0000000000000000000000000000000000000000000000000000000000000001",
-        )
-        .unwrap();
+        let event_id =
+            EventId::from_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .unwrap();
         let tags = BaseTransport::create_response_tags(&pubkey, &event_id);
         assert_eq!(tags.len(), 2);
 
@@ -286,5 +410,58 @@ mod tests {
     fn test_convert_event_to_mcp_oversized_message() {
         let big = "x".repeat(MAX_MESSAGE_SIZE + 1);
         assert!(!crate::core::validation::validate_message_size(&big));
+    }
+
+    // ── compose_outbound_tags ──────────────────────────────────
+
+    fn make_custom_tag(name: &str) -> Tag {
+        Tag::custom(TagKind::Custom(name.into()), Vec::<String>::new())
+    }
+
+    #[test]
+    fn compose_outbound_tags_ordering() {
+        let keys = Keys::generate();
+        let base = vec![Tag::public_key(keys.public_key())];
+        let discovery = vec![make_custom_tag("support_encryption")];
+        let negotiation = vec![make_custom_tag("pmi")];
+
+        let result = BaseTransport::compose_outbound_tags(&base, &discovery, &negotiation);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].clone().to_vec()[0], "p");
+        assert_eq!(result[1].clone().to_vec()[0], "support_encryption");
+        assert_eq!(result[2].clone().to_vec()[0], "pmi");
+    }
+
+    #[test]
+    fn compose_outbound_tags_empty_discovery() {
+        let keys = Keys::generate();
+        let base = vec![Tag::public_key(keys.public_key())];
+        let negotiation = vec![make_custom_tag("pmi")];
+
+        let result = BaseTransport::compose_outbound_tags(&base, &[], &negotiation);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].clone().to_vec()[0], "p");
+        assert_eq!(result[1].clone().to_vec()[0], "pmi");
+    }
+
+    #[test]
+    fn compose_outbound_tags_all_empty() {
+        let result = BaseTransport::compose_outbound_tags(&[], &[], &[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn compose_outbound_tags_preserves_all_elements() {
+        let discovery = vec![
+            make_custom_tag("support_encryption"),
+            make_custom_tag("support_encryption_ephemeral"),
+        ];
+        let result = BaseTransport::compose_outbound_tags(&[], &discovery, &[]);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].clone().to_vec()[0], "support_encryption");
+        assert_eq!(
+            result[1].clone().to_vec()[0],
+            "support_encryption_ephemeral"
+        );
     }
 }

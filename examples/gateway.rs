@@ -2,6 +2,8 @@
 //!
 //! This demonstrates how to create a ContextVM gateway that receives
 //! MCP requests over Nostr and responds to them.
+//!
+//! Usage: cargo run --example gateway
 
 use contextvm_sdk::core::types::*;
 use contextvm_sdk::gateway::{GatewayConfig, NostrMCPGateway};
@@ -17,18 +19,14 @@ async fn main() -> contextvm_sdk::Result<()> {
     println!("Server pubkey: {}", keys.public_key().to_hex());
 
     // Configure the gateway
-    let config = GatewayConfig {
-        nostr_config: NostrServerTransportConfig {
-            relay_urls: vec!["wss://relay.damus.io".to_string()],
-            server_info: Some(ServerInfo {
-                name: Some("Echo Server".to_string()),
-                about: Some("A simple echo tool exposed via ContextVM".to_string()),
-                ..Default::default()
-            }),
-            is_public_server: true,
-            ..Default::default()
-        },
-    };
+    let nostr_config = NostrServerTransportConfig::default()
+        .with_server_info(
+            ServerInfo::default()
+                .with_name("Echo Server")
+                .with_about("A simple echo tool exposed via ContextVM"),
+        )
+        .with_announced_server(true);
+    let config = GatewayConfig::new(nostr_config);
 
     let mut gateway = NostrMCPGateway::new(keys, config).await?;
     let mut rx = gateway.start().await?;

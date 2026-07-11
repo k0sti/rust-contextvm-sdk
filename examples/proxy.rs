@@ -6,6 +6,7 @@ use contextvm_sdk::core::types::*;
 use contextvm_sdk::proxy::{NostrMCPProxy, ProxyConfig};
 use contextvm_sdk::signer;
 use contextvm_sdk::transport::client::NostrClientTransportConfig;
+
 #[tokio::main]
 async fn main() -> contextvm_sdk::Result<()> {
     tracing_subscriber::fmt::init();
@@ -17,14 +18,10 @@ async fn main() -> contextvm_sdk::Result<()> {
     let keys = signer::generate();
     println!("Client pubkey: {}", keys.public_key().to_hex());
 
-    let config = ProxyConfig {
-        nostr_config: NostrClientTransportConfig {
-            relay_urls: vec!["wss://relay.damus.io".to_string()],
-            server_pubkey: server_pubkey_hex,
-            encryption_mode: EncryptionMode::Optional,
-            ..Default::default()
-        },
-    };
+    let nostr_config = NostrClientTransportConfig::default()
+        .with_server_pubkey(server_pubkey_hex)
+        .with_encryption_mode(EncryptionMode::Optional);
+    let config = ProxyConfig::new(nostr_config);
 
     let mut proxy = NostrMCPProxy::new(keys, config).await?;
     let mut rx = proxy.start().await?;
@@ -42,7 +39,10 @@ async fn main() -> contextvm_sdk::Result<()> {
 
     // Wait for response
     if let Some(response) = rx.recv().await {
-        println!("Response: {}", serde_json::to_string_pretty(&response).unwrap());
+        println!(
+            "Response: {}",
+            serde_json::to_string_pretty(&response).unwrap()
+        );
     }
 
     proxy.stop().await?;
